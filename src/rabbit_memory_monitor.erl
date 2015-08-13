@@ -41,7 +41,7 @@
                }).
 
 -define(SERVER, ?MODULE).
--define(DEFAULT_UPDATE_INTERVAL, 2500).
+-define(DEFAULT_UPDATE_INTERVAL, 500).
 -define(TABLE_NAME, ?MODULE).
 
 %% If all queues are pushed to disk (duration 0), then the sum of

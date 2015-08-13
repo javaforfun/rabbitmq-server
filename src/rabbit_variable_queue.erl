@@ -323,11 +323,12 @@
 %% When we discover that we should write some indices to disk for some
 %% betas, the IO_BATCH_SIZE sets the number of betas that we must be
 %% due to write indices for before we do any work at all.
--define(IO_BATCH_SIZE, 2048). %% next power-of-2 after ?CREDIT_DISC_BOUND
+-define(IO_BATCH_SIZE, 16384). %% next power-of-2 after ?CREDIT_DISC_BOUND
 -define(HEADER_GUESS_SIZE, 100). %% see determine_persist_to/2
 -define(PERSISTENT_MSG_STORE, msg_store_persistent).
 -define(TRANSIENT_MSG_STORE,  msg_store_transient).
 -define(QUEUE, lqueue).
+-define(SEGMENT_ENTRY_COUNT, 16384).
 
 -include("rabbit.hrl").
 -include("rabbit_framing.hrl").
@@ -587,7 +588,7 @@ publish(Msg = #basic_message { is_persistent = IsPersistent, id = MsgId },
                    State2#vqstate{ next_seq_id = SeqId + 1,
                                    in_counter  = InCount1,
                                    unconfirmed = UC1 }),
-    a(reduce_memory_use(maybe_update_rates(State3))).
+    a(State3).
 
 publish_delivered(Msg = #basic_message { is_persistent = IsPersistent,
                                          id = MsgId },
@@ -757,6 +758,7 @@ depth(State = #vqstate { ram_pending_ack  = RPA,
 
 set_ram_duration_target(
   DurationTarget, State = #vqstate {
+                    ram_msg_count = RamMsgCount,
                     rates = #rates { in      = AvgIngressRate,
                                      out     = AvgEgressRate,
                                      ack_in  = AvgAckIngressRate,
@@ -773,8 +775,14 @@ set_ram_duration_target(
     a(case TargetRamCount1 == infinity orelse
           (TargetRamCount =/= infinity andalso
            TargetRamCount1 >= TargetRamCount) of
-          true  -> State1;
-          false -> reduce_memory_use(State1)
+          true  ->
+              State1;
+          false when RamMsgCount == 0 ->
+              State1;
+          false ->
+              rabbit_log:info("Paging, ram_msg_count:~p, target:~p, rate:~p~n",
+                              [RamMsgCount, TargetRamCount1, Rate]),
+              reduce_memory_use(State1)
       end).
 
 maybe_update_rates(State = #vqstate{ in_counter  = InCount,
@@ -1782,7 +1790,19 @@ reduce_memory_use(State = #vqstate {
             %% namely index writing, i.e. messages that are genuine
             %% betas and not gammas, is bounded by the credit_flow
             %% limiting of the alpha->beta conversion above.
-            push_betas_to_deltas(S2, State1);
+            State3 = #vqstate{ram_msg_count = C2} =
+                push_betas_to_deltas(S2, State1),
+            case C2 < ?SEGMENT_ENTRY_COUNT * 10 andalso S2 > ?IO_BATCH_SIZE * 2 of
+                true ->
+                    rabbit_log:info("start_gc, ram_msg_count:~p, target:~p~n",
+                                    [C2, TargetRamCount]),
+
+                    [garbage_collect(Pid) || Pid <- processes()],
+                    rabbit_log:info("gc_done~n");
+                _ ->
+                    ok
+            end,
+            State3;
         _  ->
             State1
     end.

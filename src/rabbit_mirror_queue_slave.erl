@@ -49,7 +49,7 @@
         ]).
 
 -define(SYNC_INTERVAL,                 25). %% milliseconds
--define(RAM_DURATION_UPDATE_INTERVAL,  5000).
+-define(RAM_DURATION_UPDATE_INTERVAL,  1000).
 -define(DEATH_TIMEOUT,                 20000). %% 20 seconds
 
 -record(state, { q,
@@ -674,7 +674,7 @@ next_state(State = #state{backing_queue = BQ, backing_queue_state = BQS}) ->
     State1 = confirm_messages(MsgIds,
                               State #state { backing_queue_state = BQS1 }),
     case BQ:needs_timeout(BQS1) of
-        false -> {stop_sync_timer(State1),   hibernate     };
+        false -> {stop_sync_timer(State1),   ?SYNC_INTERVAL};
         idle  -> {stop_sync_timer(State1),   ?SYNC_INTERVAL};
         timed -> {ensure_sync_timer(State1), 0             }
     end.

@@ -323,12 +323,11 @@
 %% When we discover that we should write some indices to disk for some
 %% betas, the IO_BATCH_SIZE sets the number of betas that we must be
 %% due to write indices for before we do any work at all.
--define(IO_BATCH_SIZE, 16384). %% next power-of-2 after ?CREDIT_DISC_BOUND
+-define(IO_BATCH_SIZE, 2048). %% next power-of-2 after ?CREDIT_DISC_BOUND
 -define(HEADER_GUESS_SIZE, 100). %% see determine_persist_to/2
 -define(PERSISTENT_MSG_STORE, msg_store_persistent).
 -define(TRANSIENT_MSG_STORE,  msg_store_transient).
 -define(QUEUE, lqueue).
--define(SEGMENT_ENTRY_COUNT, 16384).
 
 -include("rabbit.hrl").
 -include("rabbit_framing.hrl").
@@ -610,7 +609,7 @@ publish_delivered(Msg = #basic_message { is_persistent = IsPersistent,
                                      out_counter      = OutCount + 1,
                                      in_counter       = InCount  + 1,
                                      unconfirmed      = UC1 }),
-    {SeqId, a(reduce_memory_use(maybe_update_rates(State3)))}.
+    {SeqId, a(State3)}.
 
 discard(_MsgId, _ChPid, _Flow, State) -> State.
 
@@ -722,13 +721,11 @@ requeue(AckTags, #vqstate { delta      = Delta,
     {Delta1, MsgIds2, State3}       = delta_merge(SeqIds1, Delta, MsgIds1,
                                                   State2),
     MsgCount = length(MsgIds2),
-    {MsgIds2, a(reduce_memory_use(
-                  maybe_update_rates(
-                    State3 #vqstate { delta      = Delta1,
-                                      q3         = Q3a,
-                                      q4         = Q4a,
-                                      in_counter = InCounter + MsgCount,
-                                      len        = Len + MsgCount })))}.
+    {MsgIds2, a(State3 #vqstate { delta      = Delta1,
+                                  q3         = Q3a,
+                                  q4         = Q4a,
+                                  in_counter = InCounter + MsgCount,
+                                  len        = Len + MsgCount })}.
 
 ackfold(MsgFun, Acc, State, AckTags) ->
     {AccN, StateN} =
@@ -756,33 +753,25 @@ depth(State = #vqstate { ram_pending_ack  = RPA,
                          qi_pending_ack   = QPA }) ->
     len(State) + gb_trees:size(RPA) + gb_trees:size(DPA) + gb_trees:size(QPA).
 
-set_ram_duration_target(
-  DurationTarget, State = #vqstate {
-                    ram_msg_count = RamMsgCount,
-                    rates = #rates { in      = AvgIngressRate,
-                                     out     = AvgEgressRate,
-                                     ack_in  = AvgAckIngressRate,
-                                     ack_out = AvgAckEgressRate },
-                    target_ram_count = TargetRamCount }) ->
-    Rate =
-        AvgEgressRate + AvgIngressRate + AvgAckEgressRate + AvgAckIngressRate,
+set_ram_duration_target(DurationTarget,
+                        State = #vqstate{ram_msg_count = RamMsgCount}) ->
     TargetRamCount1 =
         case DurationTarget of
             infinity  -> infinity;
-            _         -> trunc(DurationTarget * Rate) %% msgs = sec * msgs/sec
+            _         -> RamMsgCount div 10 %% msgs = sec * msgs/sec
         end,
     State1 = State #vqstate { target_ram_count = TargetRamCount1 },
-    a(case TargetRamCount1 == infinity orelse
-          (TargetRamCount =/= infinity andalso
-           TargetRamCount1 >= TargetRamCount) of
+    a(case TargetRamCount1 == infinity orelse RamMsgCount == 0 of
           true  ->
               State1;
-          false when RamMsgCount == 0 ->
-              State1;
           false ->
-              rabbit_log:info("Paging, ram_msg_count:~p, target:~p, rate:~p~n",
-                              [RamMsgCount, TargetRamCount1, Rate]),
-              reduce_memory_use(State1)
+              OldPri = process_flag(priority, high),
+              rabbit_log:info("Paging, ram_msg_count:~p, target_count:~p",
+                              [RamMsgCount, TargetRamCount1]),
+              State2 = reduce_memory_use(State1),
+              rabbit_log:info("Page_done~n"),
+              process_flag(priority, OldPri),
+              State2
       end).
 
 maybe_update_rates(State = #vqstate{ in_counter  = InCount,
@@ -1781,31 +1770,24 @@ reduce_memory_use(State = #vqstate {
                   State2
         end,
 
-    case chunk_size(?QUEUE:len(Q2) + ?QUEUE:len(Q3),
-                    permitted_beta_count(State1)) of
-        S2 when S2 >= ?IO_BATCH_SIZE ->
-            %% There is an implicit, but subtle, upper bound here. We
-            %% may shuffle a lot of messages from Q2/3 into delta, but
-            %% the number of these that require any disk operation,
-            %% namely index writing, i.e. messages that are genuine
-            %% betas and not gammas, is bounded by the credit_flow
-            %% limiting of the alpha->beta conversion above.
-            State3 = #vqstate{ram_msg_count = C2} =
-                push_betas_to_deltas(S2, State1),
-            case C2 < ?SEGMENT_ENTRY_COUNT * 10 andalso S2 > ?IO_BATCH_SIZE * 2 of
-                true ->
-                    rabbit_log:info("start_gc, ram_msg_count:~p, target:~p~n",
-                                    [C2, TargetRamCount]),
+    State3 = #vqstate{ram_msg_count = RamMsgCount2} =
+        case chunk_size(?QUEUE:len(Q2) + ?QUEUE:len(Q3),
+                        permitted_beta_count(State1)) of
+            S2 when S2 >= ?IO_BATCH_SIZE ->
+                %% There is an implicit, but subtle, upper bound here. We
+                %% may shuffle a lot of messages from Q2/3 into delta, but
+                %% the number of these that require any disk operation,
+                %% namely index writing, i.e. messages that are genuine
+                %% betas and not gammas, is bounded by the credit_flow
+                %% limiting of the alpha->beta conversion above.
+                push_betas_to_deltas(S2, State1);
+            _  ->
+                State1
+        end,
 
-                    [garbage_collect(Pid) || Pid <- processes()],
-                    rabbit_log:info("gc_done~n");
-                _ ->
-                    ok
-            end,
-            State3;
-        _  ->
-            State1
-    end.
+    rabbit_log:info("start_gc, ram_msg_count:~p", [RamMsgCount2]),
+    [garbage_collect(Pid) || Pid <- processes()],
+    State3.
 
 limit_ram_acks(0, State) ->
     {0, State};

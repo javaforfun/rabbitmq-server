@@ -758,10 +758,11 @@ set_ram_duration_target(DurationTarget,
     TargetRamCount1 =
         case DurationTarget of
             infinity  -> infinity;
-            _         -> RamMsgCount div 10 %% msgs = sec * msgs/sec
+            _         -> RamMsgCount div 10 %% Rate is useless
         end,
     State1 = State #vqstate { target_ram_count = TargetRamCount1 },
-    a(case TargetRamCount1 == infinity orelse RamMsgCount == 0 of
+    a(case TargetRamCount1 == infinity orelse
+          TargetRamCount1 < ?IO_BATCH_SIZE of
           true  ->
               State1;
           false ->

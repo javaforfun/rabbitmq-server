@@ -30,6 +30,9 @@
 %% Boot steps.
 -export([maybe_insert_default_data/0, boot_delegate/0, recover/0]).
 
+%% for tests
+-export([validate_msg_store_io_batch_size_and_credit_disc_bound/2]).
+
 -rabbit_boot_step({pre_boot, [{description, "rabbit boot start"}]}).
 
 -rabbit_boot_step({codec_correctness_check,
@@ -189,13 +192,8 @@
 -include("rabbit_framing.hrl").
 -include("rabbit.hrl").
 
--define(APPS, [os_mon, mnesia, rabbit]).
+-define(APPS, [os_mon, mnesia, rabbit_common, rabbit]).
 
-%% HiPE compilation uses multiple cores anyway, but some bits are
-%% IO-bound so we can go faster if we parallelise a bit more. In
-%% practice 2 processes seems just as fast as any other number > 1,
-%% and keeps the progress bar realistic-ish.
--define(HIPE_PROCESSES, 2).
 -define(ASYNC_THREADS_WARNING_THRESHOLD, 8).
 
 %%----------------------------------------------------------------------------
@@ -245,59 +243,6 @@
 
 %%----------------------------------------------------------------------------
 
-%% HiPE compilation happens before we have log handlers - so we have
-%% to io:format/2, it's all we can do.
-
-maybe_hipe_compile() ->
-    {ok, Want} = application:get_env(rabbit, hipe_compile),
-    Can = code:which(hipe) =/= non_existing,
-    case {Want, Can} of
-        {true,  true}  -> hipe_compile();
-        {true,  false} -> false;
-        {false, _}     -> {ok, disabled}
-    end.
-
-log_hipe_result({ok, disabled}) ->
-    ok;
-log_hipe_result({ok, Count, Duration}) ->
-    rabbit_log:info(
-      "HiPE in use: compiled ~B modules in ~Bs.~n", [Count, Duration]);
-log_hipe_result(false) ->
-    io:format(
-      "~nNot HiPE compiling: HiPE not found in this Erlang installation.~n"),
-    rabbit_log:warning(
-      "Not HiPE compiling: HiPE not found in this Erlang installation.~n").
-
-%% HiPE compilation happens before we have log handlers and can take a
-%% long time, so make an exception to our no-stdout policy and display
-%% progress via stdout.
-hipe_compile() ->
-    {ok, HipeModulesAll} = application:get_env(rabbit, hipe_modules),
-    HipeModules = [HM || HM <- HipeModulesAll, code:which(HM) =/= non_existing],
-    Count = length(HipeModules),
-    io:format("~nHiPE compiling:  |~s|~n                 |",
-              [string:copies("-", Count)]),
-    T1 = time_compat:monotonic_time(),
-    PidMRefs = [spawn_monitor(fun () -> [begin
-                                             {ok, M} = hipe:c(M, [o3]),
-                                             io:format("#")
-                                         end || M <- Ms]
-                              end) ||
-                   Ms <- split(HipeModules, ?HIPE_PROCESSES)],
-    [receive
-         {'DOWN', MRef, process, _, normal} -> ok;
-         {'DOWN', MRef, process, _, Reason} -> exit(Reason)
-     end || {_Pid, MRef} <- PidMRefs],
-    T2 = time_compat:monotonic_time(),
-    Duration = time_compat:convert_time_unit(T2 - T1, native, seconds),
-    io:format("|~n~nCompiled ~B modules in ~Bs~n", [Count, Duration]),
-    {ok, Count, Duration}.
-
-split(L, N) -> split0(L, [[] || _ <- lists:seq(1, N)]).
-
-split0([],       Ls)       -> Ls;
-split0([I | Is], [L | Ls]) -> split0(Is, Ls ++ [[I | L]]).
-
 ensure_application_loaded() ->
     %% We end up looking at the rabbit app's env for HiPE and log
     %% handling, so it needs to be loaded. But during the tests, it
@@ -309,10 +254,12 @@ ensure_application_loaded() ->
 
 start() ->
     start_it(fun() ->
-                     %% We do not want to HiPE compile or upgrade
-                     %% mnesia after just restarting the app
+                     %% We do not want to upgrade mnesia after just
+                     %% restarting the app.
                      ok = ensure_application_loaded(),
+                     HipeResult = rabbit_hipe:maybe_hipe_compile(),
                      ok = ensure_working_log_handlers(),
+                     rabbit_hipe:log_hipe_result(HipeResult),
                      rabbit_node_monitor:prepare_cluster_status_files(),
                      rabbit_mnesia:check_cluster_consistency(),
                      broker_start()
@@ -321,9 +268,9 @@ start() ->
 boot() ->
     start_it(fun() ->
                      ok = ensure_application_loaded(),
-                     HipeResult = maybe_hipe_compile(),
+                     HipeResult = rabbit_hipe:maybe_hipe_compile(),
                      ok = ensure_working_log_handlers(),
-                     log_hipe_result(HipeResult),
+                     rabbit_hipe:log_hipe_result(HipeResult),
                      rabbit_node_monitor:prepare_cluster_status_files(),
                      ok = rabbit_upgrade:maybe_upgrade_mnesia(),
                      %% It's important that the consistency check happens after
@@ -456,7 +403,8 @@ status() ->
           {uptime,           begin
                                  {T,_} = erlang:statistics(wall_clock),
                                  T div 1000
-                             end}],
+                             end},
+          {kernel,           {net_ticktime, net_kernel:get_net_ticktime()}}],
     S1 ++ S2 ++ S3 ++ S4.
 
 alarms() ->
@@ -517,6 +465,7 @@ start(normal, []) ->
             print_banner(),
             log_banner(),
             warn_if_kernel_config_dubious(),
+            warn_if_disc_io_options_dubious(),
             rabbit_boot_steps:run_boot_steps(),
             {ok, SupPid};
         Error ->
@@ -786,6 +735,86 @@ warn_if_kernel_config_dubious() ->
         false -> rabbit_log:warning("Nagle's algorithm is enabled for sockets, "
                                     "network I/O latency will be higher~n");
         true  -> ok
+    end.
+
+warn_if_disc_io_options_dubious() ->
+    %% if these values are not set, it doesn't matter since
+    %% rabbit_variable_queue will pick up the values defined in the
+    %% IO_BATCH_SIZE and CREDIT_DISC_BOUND constants.
+    CreditDiscBound = rabbit_misc:get_env(rabbit, msg_store_credit_disc_bound,
+                                          undefined),
+    IoBatchSize = rabbit_misc:get_env(rabbit, msg_store_io_batch_size,
+                                      undefined),
+    case catch validate_msg_store_io_batch_size_and_credit_disc_bound(
+                 CreditDiscBound, IoBatchSize) of
+        ok -> ok;
+        {error, {Reason, Vars}} ->
+            rabbit_log:warning(Reason, Vars)
+    end.
+
+validate_msg_store_io_batch_size_and_credit_disc_bound(CreditDiscBound,
+                                                       IoBatchSize) ->
+    case IoBatchSize of
+        undefined ->
+            ok;
+        IoBatchSize when is_integer(IoBatchSize) ->
+            if IoBatchSize < ?IO_BATCH_SIZE ->
+                    throw({error,
+                     {"io_batch_size of ~b lower than recommended value ~b, "
+                      "paging performance may worsen~n",
+                      [IoBatchSize, ?IO_BATCH_SIZE]}});
+               true ->
+                    ok
+            end;
+        IoBatchSize ->
+            throw({error,
+             {"io_batch_size should be an integer, but ~b given",
+              [IoBatchSize]}})
+    end,
+
+    %% CreditDiscBound = {InitialCredit, MoreCreditAfter}
+    {RIC, RMCA} = ?CREDIT_DISC_BOUND,
+    case CreditDiscBound of
+        undefined ->
+            ok;
+        {IC, MCA} when is_integer(IC), is_integer(MCA) ->
+            if IC < RIC; MCA < RMCA ->
+                    throw({error,
+                     {"msg_store_credit_disc_bound {~b, ~b} lower than"
+                      "recommended value {~b, ~b},"
+                      " paging performance may worsen~n",
+                      [IC, MCA, RIC, RMCA]}});
+               true ->
+                    ok
+            end;
+        {IC, MCA} ->
+            throw({error,
+             {"both msg_store_credit_disc_bound values should be integers, but ~p given",
+              [{IC, MCA}]}});
+        CreditDiscBound ->
+            throw({error,
+             {"invalid msg_store_credit_disc_bound value given: ~p",
+              [CreditDiscBound]}})
+    end,
+
+    case {CreditDiscBound, IoBatchSize} of
+        {undefined, undefined} ->
+            ok;
+        {_CDB, undefined} ->
+            ok;
+        {undefined, _IBS} ->
+            ok;
+        {{InitialCredit, _MCA}, IoBatchSize} ->
+            if IoBatchSize < InitialCredit ->
+                    throw(
+                      {error,
+                       {"msg_store_io_batch_size ~b should be bigger than the initial "
+                        "credit value from msg_store_credit_disc_bound ~b,"
+                        " paging performance may worsen~n",
+                        [IoBatchSize, InitialCredit]}});
+               true ->
+                    ok
+            end
     end.
 
 home_dir() ->

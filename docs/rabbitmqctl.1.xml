@@ -722,6 +722,33 @@
         </varlistentry>
 
         <varlistentry>
+          <term>
+          <cmdsynopsis>
+            <command>authenticate_user</command> <arg choice="req"><replaceable>username</replaceable></arg> <arg choice="req"><replaceable>password</replaceable></arg>
+          </cmdsynopsis>
+          </term>
+          <listitem>
+            <variablelist>
+              <varlistentry>
+                <term>username</term>
+                <listitem><para>The name of the user.</para></listitem>
+              </varlistentry>
+              <varlistentry>
+                <term>password</term>
+                <listitem><para>The password of the user.</para></listitem>
+              </varlistentry>
+            </variablelist>
+            <para role="example-prefix">For example:</para>
+            <screen role="example">rabbitmqctl authenticate_user tonyg verifyit</screen>
+            <para role="example">
+              This command instructs the RabbitMQ broker to authenticate the
+              user named <command>tonyg</command> with password
+              <command>verifyit</command>.
+            </para>
+          </listitem>
+        </varlistentry>
+
+        <varlistentry>
           <term><cmdsynopsis><command>set_user_tags</command> <arg choice="req"><replaceable>username</replaceable></arg> <arg choice="req"><replaceable>tag</replaceable> ...</arg></cmdsynopsis></term>
           <listitem>
             <variablelist>
@@ -1228,6 +1255,11 @@
                 <listitem><para>Id of the Erlang process representing the connection
                   which is the exclusive owner of the queue. Empty if the
                   queue is non-exclusive.</para></listitem>
+              </varlistentry>
+              <varlistentry>
+                <term>exclusive</term>
+                <listitem><para>True if queue is exclusive (i.e. has
+                  owner_pid), false otherwise</para></listitem>
               </varlistentry>
               <varlistentry>
                 <term>exclusive_consumer_pid</term>
@@ -1920,6 +1952,58 @@
                     The new memory threshold fraction at which flow
                     control is triggered, as a floating point number
                     greater than or equal to 0.
+                </para></listitem>
+              </varlistentry>
+            </variablelist>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term><cmdsynopsis><command>set_vm_memory_high_watermark absolute</command> <arg choice="req"><replaceable>memory_limit</replaceable></arg></cmdsynopsis></term>
+          <listitem>
+            <variablelist>
+              <varlistentry>
+                <term>memory_limit</term>
+                <listitem><para>
+                    The new memory limit at which flow control is
+                    triggered, expressed in bytes as an integer number
+                    greater than or equal to 0 or as a string with memory units
+                    (e.g. 512M or 1G). Available units are:
+                    k, kiB: kibibytes (2^10 bytes)
+                    M, MiB: mebibytes (2^20)
+                    G, GiB: gibibytes (2^30)
+                    kB: kilobytes (10^3)
+                    MB: megabytes (10^6)
+                    GB: gigabytes (10^9)
+                </para></listitem>
+              </varlistentry>
+            </variablelist>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term><cmdsynopsis><command>set_disk_free_limit</command> <arg choice="req"><replaceable>disk_limit</replaceable></arg></cmdsynopsis></term>
+          <listitem>
+            <variablelist>
+              <varlistentry>
+                <term>disk_limit</term>
+                <listitem><para>
+                    Lower bound limit as an integer in bytes or a string with memory units (see vm_memory_high_watermark),
+                    e.g. 512M or 1G. Once free disk space reaches the limit, a disk alarm will be set.
+                </para></listitem>
+              </varlistentry>
+            </variablelist>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term><cmdsynopsis><command>set_disk_free_limit mem_relative</command> <arg choice="req"><replaceable>fraction</replaceable></arg></cmdsynopsis></term>
+          <listitem>
+            <variablelist>
+              <varlistentry>
+                <term>fraction</term>
+                <listitem><para>
+                    Limit relative to the total amount available RAM 
+                    as a non-negative floating point number. 
+                    Values lower than 1.0 can be dangerous and 
+                    should be used carefully.
                 </para></listitem>
               </varlistentry>
             </variablelist>

@@ -551,9 +551,9 @@ forget_group(GroupName) ->
 
 init([GroupName, Module, Args, TxnFun]) ->
     put(process_name, {?MODULE, GroupName}),
-    random:seed(erlang:phash2([node()]),
-                time_compat:monotonic_time(),
-                time_compat:unique_integer()),
+    _ = random:seed(erlang:phash2([node()]),
+                    time_compat:monotonic_time(),
+                    time_compat:unique_integer()),
     Self = make_member(GroupName),
     gen_server2:cast(self(), join),
     {ok, #state { self                = Self,
@@ -713,6 +713,10 @@ handle_info(flush, State) ->
 handle_info(timeout, State) ->
     noreply(flush_broadcast_buffer(State));
 
+handle_info({'DOWN', _MRef, process, _Pid, _Reason},
+            State = #state { shutting_down =
+                                 {true, {shutdown, ring_shutdown}} }) ->
+    noreply(State);
 handle_info({'DOWN', MRef, process, _Pid, Reason},
             State = #state { self          = Self,
                              left          = Left,
@@ -902,7 +906,7 @@ ensure_broadcast_timer(State = #state { broadcast_buffer = [],
     State;
 ensure_broadcast_timer(State = #state { broadcast_buffer = [],
                                         broadcast_timer  = TRef }) ->
-    erlang:cancel_timer(TRef),
+    _ = erlang:cancel_timer(TRef),
     State #state { broadcast_timer = undefined };
 ensure_broadcast_timer(State = #state { broadcast_timer = undefined }) ->
     TRef = erlang:send_after(?BROADCAST_TIMER, self(), flush),
@@ -1487,7 +1491,7 @@ maybe_confirm(_Self, _Id, Confirms, _PubNums) ->
     Confirms.
 
 purge_confirms(Confirms) ->
-    [gen_server2:reply(From, ok) || {_PubNum, From} <- queue:to_list(Confirms)],
+    _ = [gen_server2:reply(From, ok) || {_PubNum, From} <- queue:to_list(Confirms)],
     queue:new().
 
 

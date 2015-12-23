@@ -76,7 +76,7 @@ check_user_login(Username, AuthProps) ->
                   %% it gives us
                   case try_authenticate(Mod, Username, AuthProps) of
                       {ok, ModNUser = #auth_user{impl = Impl}} ->
-                          user(ModNUser, {ok, [{Mod, Impl}]});
+                          user(ModNUser, {ok, [{Mod, Impl}], []});
                       Else ->
                           Else
                   end;
@@ -98,9 +98,10 @@ try_authenticate(Module, Username, AuthProps) ->
 
 try_authorize(Modules, Username) ->
     lists:foldr(
-      fun (Module, {ok, ModsImpls}) ->
+      fun (Module, {ok, ModsImpls, ModsTags}) ->
               case Module:user_login_authorization(Username) of
-                  {ok, Impl}      -> {ok, [{Module, Impl} | ModsImpls]};
+                  {ok, Impl, Tags}-> {ok, [{Module, Impl} | ModsImpls], ModsTags ++ Tags};
+                  {ok, Impl}      -> {ok, [{Module, Impl} | ModsImpls], ModsTags};
                   {error, E}      -> {refused, Username,
                                         "~s failed authorizing ~s: ~p~n",
                                         [Module, Username, E]};
@@ -108,11 +109,11 @@ try_authorize(Modules, Username) ->
               end;
           (_,      {refused, F, A}) ->
               {refused, Username, F, A}
-      end, {ok, []}, Modules).
+      end, {ok, [], []}, Modules).
 
-user(#auth_user{username = Username, tags = Tags}, {ok, ModZImpls}) ->
+user(#auth_user{username = Username, tags = Tags}, {ok, ModZImpls, ModZTags}) ->
     {ok, #user{username       = Username,
-               tags           = Tags,
+               tags           = Tags ++ ModZTags,
                authz_backends = ModZImpls}};
 user(_AuthUser, Error) ->
     Error.
@@ -141,7 +142,7 @@ check_vhost_access(User = #user{username       = Username,
                               auth_user(User, Impl), VHostPath, Sock)
                 end,
                 Mod, "access to vhost '~s' refused for user '~s'",
-                [VHostPath, Username]);
+                [VHostPath, Username], not_allowed);
          (_, Else) ->
               Else
       end, ok, Modules).
@@ -163,7 +164,11 @@ check_resource_access(User = #user{username       = Username,
          (_, Else) -> Else
       end, ok, Modules).
 
+
 check_access(Fun, Module, ErrStr, ErrArgs) ->
+    check_access(Fun, Module, ErrStr, ErrArgs, access_refused).
+
+check_access(Fun, Module, ErrStr, ErrArgs, ErrName) ->
     Allow = case Fun() of
                 {error, E}  ->
                     rabbit_log:error(ErrStr ++ " by ~s: ~p~n",
@@ -176,5 +181,5 @@ check_access(Fun, Module, ErrStr, ErrArgs) ->
         true ->
             ok;
         false ->
-            rabbit_misc:protocol_error(access_refused, ErrStr, ErrArgs)
+            rabbit_misc:protocol_error(ErrName, ErrStr, ErrArgs)
     end.

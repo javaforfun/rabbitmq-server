@@ -44,6 +44,7 @@
 -define(SERVER, ?MODULE).
 -define(DEFAULT_MIN_DISK_CHECK_INTERVAL, 100).
 -define(DEFAULT_MAX_DISK_CHECK_INTERVAL, 10000).
+-define(DEFAULT_DISK_FREE_LIMIT, 50000000).
 %% 250MB/s i.e. 250kB/ms
 -define(FAST_RATE, (250 * 1000)).
 
@@ -61,14 +62,17 @@
           %% timer that drives periodic checks
           timer,
           %% is free disk space alarm currently in effect?
-          alarmed
+          alarmed,
+          %% is monitoring enabled? false on unsupported
+          %% platforms
+          enabled
 }).
 
 %%----------------------------------------------------------------------------
 
 -ifdef(use_specs).
 
--type(disk_free_limit() :: (integer() | {'mem_relative', float()})).
+-type(disk_free_limit() :: (integer() | string() | {'mem_relative', float()})).
 -spec(start_link/1 :: (disk_free_limit()) -> rabbit_types:ok_pid_or_error()).
 -spec(get_disk_free_limit/0 :: () -> integer()).
 -spec(set_disk_free_limit/1 :: (disk_free_limit()) -> 'ok').
@@ -117,7 +121,8 @@ init([Limit]) ->
     State = #state{dir          = Dir,
                    min_interval = ?DEFAULT_MIN_DISK_CHECK_INTERVAL,
                    max_interval = ?DEFAULT_MAX_DISK_CHECK_INTERVAL,
-                   alarmed      = false},
+                   alarmed      = false,
+                   enabled      = true},
     case {catch get_disk_free(Dir),
           vm_memory_monitor:get_total_memory()} of
         {N1, N2} when is_integer(N1), is_integer(N2) ->
@@ -125,11 +130,16 @@ init([Limit]) ->
         Err ->
             rabbit_log:info("Disabling disk free space monitoring "
                             "on unsupported platform:~n~p~n", [Err]),
-            {stop, unsupported_platform}
+            {ok, State#state{enabled = false}}
     end.
 
 handle_call(get_disk_free_limit, _From, State = #state{limit = Limit}) ->
     {reply, Limit, State};
+
+handle_call({set_disk_free_limit, _}, _From, #state{enabled = false} = State) ->
+    rabbit_log:info("Cannot set disk free limit: "
+		    "disabled disk free space monitoring", []),
+    {reply, ok, State};
 
 handle_call({set_disk_free_limit, Limit}, _From, State) ->
     {reply, ok, set_disk_limits(State, Limit)};
@@ -224,10 +234,17 @@ parse_free_win32(CommandResult) ->
                              [{capture, all_but_first, list}]),
     list_to_integer(lists:reverse(Free)).
 
-interpret_limit({mem_relative, R}) ->
-    round(R * vm_memory_monitor:get_total_memory());
-interpret_limit(L) ->
-    L.
+interpret_limit({mem_relative, Relative}) 
+    when is_float(Relative), Relative < 1 ->
+    round(Relative * vm_memory_monitor:get_total_memory());
+interpret_limit(Absolute) -> 
+    case rabbit_resource_monitor_misc:parse_information_unit(Absolute) of
+        {ok, ParsedAbsolute} -> ParsedAbsolute;
+        {error, parse_error} ->
+            rabbit_log:error("Unable to parse disk_free_limit value ~p", 
+                             [Absolute]),
+            ?DEFAULT_DISK_FREE_LIMIT
+    end.
 
 emit_update_info(StateStr, CurrentFree, Limit) ->
     rabbit_log:info(
